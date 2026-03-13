@@ -1,0 +1,27 @@
+{
+  "name": "anime-paper-tutor",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "clean": "node scripts/clean-next.mjs",
+    "dev": "npm run clean && next dev",
+    "build": "npm run clean && next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "@pixiv/three-vrm": "^3.5.1",
+    "next": "^15.2.0",
+    "openai": "^4.104.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "three": "^0.183.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.0",
+    "@types/react": "^19.0.12",
+    "@types/react-dom": "^19.0.5",
+    "@types/three": "^0.183.1",
+    "typescript": "^5.8.3"
+  }
+}
