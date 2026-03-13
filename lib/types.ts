@@ -83,6 +83,15 @@ export type HeadNodHint = {
   amount: number;
 };
 
+export type GestureName = "neutral" | "open" | "emphasize" | "think" | "present";
+
+export type GestureHint = {
+  startMs: number;
+  endMs: number;
+  gesture: GestureName;
+  strength: number;
+};
+
 export type SpeechPerformance = {
   durationMs: number;
   emotionState: EmotionState;
@@ -91,6 +100,7 @@ export type SpeechPerformance = {
   blinkHints: BlinkHint[];
   gazeHints: GazeHint[];
   headNodHints: HeadNodHint[];
+  gestureHints: GestureHint[];
 };
 
 export type LessonBeat = {

@@ -4,6 +4,8 @@ import type {
   ClauseCue,
   EmotionState,
   GazeHint,
+  GestureHint,
+  GestureName,
   HeadNodHint,
   SpeechAlignment,
   SpeechPerformance,
@@ -260,6 +262,28 @@ function createHeadNodHints(clauses: ClauseCue[], emotionState: EmotionState): H
   }));
 }
 
+function createGestureHints(clauses: ClauseCue[], emotionState: EmotionState): GestureHint[] {
+  const gestures: GestureName[] = clauses.map((clause, index) => {
+    if (emotionState === "thoughtful") {
+      return "think";
+    }
+    if (emotionState === "excited" && clause.emphasis > 0.58) {
+      return "emphasize";
+    }
+    if (clause.emphasis > 0.52) {
+      return index % 2 === 0 ? "open" : "present";
+    }
+    return "neutral";
+  });
+
+  return clauses.map((clause, index) => ({
+    startMs: clause.startMs,
+    endMs: clause.endMs,
+    gesture: gestures[index],
+    strength: clamp(0.38 + clause.emphasis * 0.62, 0.35, 1.0),
+  }));
+}
+
 export function createSpeechPerformance(text: string): SpeechPerformance {
   const normalized = text.trim();
   const clauses = splitClauses(normalized);
@@ -275,6 +299,7 @@ export function createSpeechPerformance(text: string): SpeechPerformance {
     blinkHints: createBlinkHints(clauseCues, emotionState),
     gazeHints: createGazeHints(clauseCues, emotionState),
     headNodHints: createHeadNodHints(clauseCues, emotionState),
+    gestureHints: createGestureHints(clauseCues, emotionState),
   };
 }
 
@@ -297,5 +322,6 @@ export function createAlignedSpeechPerformance(
     blinkHints: createBlinkHints(clauseCues, emotionState),
     gazeHints: createGazeHints(clauseCues, emotionState),
     headNodHints: createHeadNodHints(clauseCues, emotionState),
+    gestureHints: createGestureHints(clauseCues, emotionState),
   };
 }
