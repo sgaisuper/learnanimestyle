@@ -121,6 +121,11 @@ function normalizeSpeechPerformance(
       startMs: scaleTime(hint.startMs, ratio),
       endMs: scaleTime(hint.endMs, ratio),
     })),
+    gestureHints: performance.gestureHints.map((hint) => ({
+      ...hint,
+      startMs: scaleTime(hint.startMs, ratio),
+      endMs: scaleTime(hint.endMs, ratio),
+    })),
   };
 }
 

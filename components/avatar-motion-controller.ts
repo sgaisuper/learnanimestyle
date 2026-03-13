@@ -4,6 +4,8 @@ import type {
   SpeechAlignment,
   EmotionState,
   GazeHint,
+  GestureHint,
+  GestureName,
   HeadNodHint,
   SpeakingState,
   SpeechPerformance,
@@ -82,11 +84,50 @@ type BlinkState = {
   doubleBlinkPendingAt: number | null;
 };
 
+type GestureArmOffset = { x?: number; y?: number; z?: number };
+
+type GesturePose = Partial<Record<
+  "leftUpperArm" | "rightUpperArm" | "leftLowerArm" | "rightLowerArm" | "leftHand" | "rightHand",
+  GestureArmOffset
+>>;
+
+const GESTURE_POSES: Record<GestureName, GesturePose> = {
+  neutral: {},
+  open: {
+    leftUpperArm:  { x: 0.22, z: -0.04 },
+    rightUpperArm: { x: 0.22, z:  0.04 },
+    leftLowerArm:  { x: 0.08 },
+    rightLowerArm: { x: 0.08 },
+  },
+  emphasize: {
+    rightUpperArm: { x: 0.28, z: 0.06 },
+    rightLowerArm: { x: 0.18 },
+    rightHand:     { x: 0.06 },
+  },
+  think: {
+    leftUpperArm:  { x: 0.16, z: -0.22 },
+    leftLowerArm:  { x: 0.38 },
+    leftHand:      { x: -0.1 },
+  },
+  present: {
+    rightUpperArm: { x: 0.16, y: -0.05 },
+    rightLowerArm: { x: 0.1 },
+    leftUpperArm:  { x: 0.06 },
+  },
+};
+
+type GestureState = {
+  current: GestureName;
+  pending: GestureName | null;
+  blend: number;
+};
+
 type MotionState = {
   blink: BlinkState;
   driftX: DriftChannel;
   driftY: DriftChannel;
   saccadeY: DriftChannel;
+  headTurnDrift: DriftChannel;
   speechEnergy: number;
   mouthOpen: number;
   tailVisemeHoldMs: number;
@@ -100,6 +141,7 @@ type MotionState = {
   chestTilt: number;
   breathPhase: number;
   idlePhase: number;
+  gesture: GestureState;
 };
 
 type PerformanceSample = {
@@ -112,6 +154,7 @@ type PerformanceSample = {
   blinkSuppressed: boolean;
   gazeHint: GazeHint | null;
   headNod: HeadNodHint | null;
+  gestureHint: GestureHint | null;
   hasActiveViseme: boolean;
   hasAlignedSpeech: boolean;
 };
@@ -324,6 +367,14 @@ function getGazeHint(performance: SpeechPerformance, playbackTimeMs: number): Ga
   );
 }
 
+function getGestureHint(performance: SpeechPerformance, playbackTimeMs: number): GestureHint | null {
+  return (
+    performance.gestureHints.find(
+      (hint) => playbackTimeMs >= hint.startMs && playbackTimeMs <= hint.endMs,
+    ) ?? null
+  );
+}
+
 function getBlinkHintWeight(performance: SpeechPerformance, playbackTimeMs: number) {
   const hint = performance.blinkHints.find(
     (entry) => playbackTimeMs >= entry.startMs && playbackTimeMs <= entry.endMs,
@@ -389,6 +440,7 @@ function samplePerformance(
       blinkSuppressed: false,
       gazeHint: null,
       headNod: null,
+      gestureHint: null,
       hasActiveViseme: false,
       hasAlignedSpeech: alignedSpeechActive,
     };
@@ -410,6 +462,7 @@ function samplePerformance(
     blinkSuppressed: blink.blinkSuppressed,
     gazeHint: getGazeHint(performance, playbackTimeMs),
     headNod: getHeadNodHint(performance, playbackTimeMs),
+    gestureHint: getGestureHint(performance, playbackTimeMs),
     hasActiveViseme: isVisemeActive,
     hasAlignedSpeech: alignedSpeechActive,
   };
@@ -484,6 +537,7 @@ export function createMotionController(
     driftX: createDriftChannel(-0.015, 0.015, 3.8, 6.2),
     driftY: createDriftChannel(-0.02, 0.025, 3.2, 5.2),
     saccadeY: createDriftChannel(-0.012, 0.012, 1.2, 2.2),
+    headTurnDrift: createDriftChannel(-0.1, 0.1, 3.5, 6.5),
     speechEnergy: 0,
     mouthOpen: 0,
     tailVisemeHoldMs: 0,
@@ -497,6 +551,7 @@ export function createMotionController(
     chestTilt: 0,
     breathPhase: Math.random() * Math.PI * 2,
     idlePhase: Math.random() * Math.PI * 2,
+    gesture: { current: "neutral", pending: null, blend: 0 },
   };
 
   vrm.scene.scale.setScalar(framingPreset.modelScale);
@@ -551,6 +606,7 @@ export function createMotionController(
       updateDrift(state.driftX, dt, 1.15);
       updateDrift(state.driftY, dt, 1.15);
       updateDrift(state.saccadeY, dt, 1.8);
+      updateDrift(state.headTurnDrift, dt, 0.85);
 
       const performanceSample = samplePerformance(
         signals.alignment,
@@ -641,6 +697,20 @@ export function createMotionController(
       state.speakingState = performanceSample.speakingState;
       state.emotionState = performanceSample.emotionState;
 
+      const targetGesture = performanceSample.gestureHint?.gesture ?? "neutral";
+      const targetGestureStrength = performanceSample.gestureHint?.strength ?? 0;
+      if (state.gesture.pending !== null) {
+        state.gesture.blend = damp(state.gesture.blend, 0, 4.5, dt);
+        if (state.gesture.blend < 0.06) {
+          state.gesture.current = state.gesture.pending;
+          state.gesture.pending = null;
+        }
+      } else if (state.gesture.current !== targetGesture) {
+        state.gesture.pending = targetGesture;
+        state.gesture.blend = damp(state.gesture.blend, 0, 4.5, dt);
+      } else {
+        state.gesture.blend = damp(state.gesture.blend, targetGestureStrength, 3.2, dt);
+      }
       const idleTime = signals.elapsedTime + state.idlePhase;
       const breath = Math.sin(idleTime * 0.96 + state.breathPhase) * 0.5 + 0.5;
       const torsoSway = Math.sin(idleTime * 0.34) * 0.008 + state.driftX.current * 0.012;
@@ -657,9 +727,21 @@ export function createMotionController(
       const gazeX = clamp(gazeBaseX * emotion.gazeWeight, -0.015, 0.015);
       const gazeY = clamp(gazeBaseY + gazeHintY, -0.05, 0.05);
       const talkingLock = performanceSample.speakingState === "speaking_active" ? 0.78 : performanceSample.speakingState === "speaking_soft" ? 0.9 : 1;
-      const targetHeadYaw = gazeX * 0.015 * talkingLock;
+      const speakingTurnScale =
+        performanceSample.speakingState === "speaking_active" ? 1.0
+        : performanceSample.speakingState === "speaking_soft" ? 0.82
+        : performanceSample.speakingState === "listening" ? 0.28
+        : 0.12;
+      const emotionTurnScale =
+        performanceSample.emotionState === "excited" ? 1.18
+        : performanceSample.emotionState === "curious" ? 1.05
+        : performanceSample.emotionState === "thoughtful" ? 0.65
+        : performanceSample.emotionState === "reassuring" ? 0.88
+        : 0.95;
+      const headTurnContrib = state.headTurnDrift.current * speakingTurnScale * emotionTurnScale;
+      const targetHeadYaw = gazeX * 0.015 * talkingLock + headTurnContrib;
       const targetHeadPitch = gazeY * 0.12 * talkingLock + nodPhase * nodAmount * 0.08 + emotion.headTilt;
-      const targetNeckYaw = gazeX * 0.008 * talkingLock;
+      const targetNeckYaw = gazeX * 0.008 * talkingLock + headTurnContrib * 0.5;
       const targetNeckPitch = gazeY * 0.05 * talkingLock + nodPhase * nodAmount * 0.04;
 
       state.headYaw = damp(state.headYaw, targetHeadYaw, 5.2, dt);
@@ -706,6 +788,8 @@ export function createMotionController(
       const shoulderLift = THREE_NS.MathUtils.degToRad(breath * 0.35) + nodAmount * 0.01;
       const leftArmOffset = Math.sin(idleTime * 0.52) * 0.006;
       const rightArmOffset = Math.sin(idleTime * 0.48 + 1.3) * 0.006;
+      const gp = GESTURE_POSES[state.gesture.current];
+      const gb = state.gesture.blend;
 
       setPoseRotation(rig.leftShoulder, basePose.leftShoulder, {
         z: shoulderLift + torsoSway * 0.1,
@@ -714,24 +798,30 @@ export function createMotionController(
         z: -shoulderLift + torsoSway * 0.1,
       });
       setPoseRotation(rig.leftUpperArm, basePose.leftUpperArm, {
-        x: THREE_NS.MathUtils.degToRad(breath * 0.5),
-        z: leftArmOffset,
+        x: THREE_NS.MathUtils.degToRad(breath * 0.5) + (gp.leftUpperArm?.x ?? 0) * gb,
+        y: (gp.leftUpperArm?.y ?? 0) * gb,
+        z: leftArmOffset + (gp.leftUpperArm?.z ?? 0) * gb,
       });
       setPoseRotation(rig.rightUpperArm, basePose.rightUpperArm, {
-        x: THREE_NS.MathUtils.degToRad(breath * 0.5),
-        z: -rightArmOffset,
+        x: THREE_NS.MathUtils.degToRad(breath * 0.5) + (gp.rightUpperArm?.x ?? 0) * gb,
+        y: (gp.rightUpperArm?.y ?? 0) * gb,
+        z: -rightArmOffset + (gp.rightUpperArm?.z ?? 0) * gb,
       });
       setPoseRotation(rig.leftLowerArm, basePose.leftLowerArm, {
-        z: leftArmOffset * 0.45,
+        x: (gp.leftLowerArm?.x ?? 0) * gb,
+        z: leftArmOffset * 0.45 + (gp.leftLowerArm?.z ?? 0) * gb,
       });
       setPoseRotation(rig.rightLowerArm, basePose.rightLowerArm, {
-        z: -rightArmOffset * 0.45,
+        x: (gp.rightLowerArm?.x ?? 0) * gb,
+        z: -rightArmOffset * 0.45 + (gp.rightLowerArm?.z ?? 0) * gb,
       });
       setPoseRotation(rig.leftHand, basePose.leftHand, {
-        z: leftArmOffset * 0.25,
+        x: (gp.leftHand?.x ?? 0) * gb,
+        z: leftArmOffset * 0.25 + (gp.leftHand?.z ?? 0) * gb,
       });
       setPoseRotation(rig.rightHand, basePose.rightHand, {
-        z: -rightArmOffset * 0.25,
+        x: (gp.rightHand?.x ?? 0) * gb,
+        z: -rightArmOffset * 0.25 + (gp.rightHand?.z ?? 0) * gb,
       });
 
       const blink = computeBlinkWeight(
@@ -756,6 +846,15 @@ export function createMotionController(
         expressionManager.setValue(Presets.Blink, clamp(blink, 0, 1));
         expressionManager.setValue(Presets.Relaxed, clamp(0.18 + (state.emotionState === "reassuring" ? 0.16 : 0), 0, 0.34));
         expressionManager.setValue(Presets.Surprised, clamp(emotion.eyeWide + state.speechEnergy * 0.08, 0, 0.24));
+        expressionManager.setValue(Presets.Happy, clamp(
+          state.emotionState === "excited"
+            ? 0.22 + state.speechEnergy * 0.14
+            : state.emotionState === "reassuring"
+              ? 0.12
+              : 0,
+          0,
+          0.36,
+        ));
       }
 
       vrm.humanoid?.update();
