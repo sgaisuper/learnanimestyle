@@ -88,12 +88,6 @@ textarea {
   text-decoration: none;
 }
 
-.paywall-hint {
-  margin: 0;
-  color: var(--muted);
-  font-size: 0.95rem;
-}
-
 .dashboard {
   height: 100%;
   max-width: 1600px;

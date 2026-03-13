@@ -50,6 +50,7 @@ npm run dev
 - You can change the TTS voice with `OPENAI_TTS_VOICE` in `.env.local`.
 - You can enable a branch-specific paywall by setting `NEXT_PUBLIC_ENABLE_PAYWALL=true` and providing `NEXT_PUBLIC_PAYWALL_CTA_URL` in Vercel for the `paywall` branch deployment.
 - A bundled sample girl model is available at `public/vrm/AvatarSample_A.vrm` and loads by default.
+- `AvatarSample_A.vrm` is sourced from the `madjin/vrm-samples` repository; keep that attribution with the sample asset and follow the usage terms noted in that project README.
 - The avatar uses a small procedural idle pose in the browser: gentle sway, breathing, and arm settling on top of the neutral pose.
 - This is an AIRI-style tutor shell, not the full `moeru-ai/airi` application.
 

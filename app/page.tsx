@@ -22,6 +22,7 @@ const MIN_WORD_SPAN_MS = 60;
 const MIN_CHUNK_SPAN_MS = 70;
 const PLAYBACK_JITTER_TOLERANCE_MS = 18;
 const PLAYBACK_FORWARD_JUMP_CAP_MS = 220;
+const FALLBACK_REVEAL_LAG_MS = 220;
 const paywallEnabled = process.env.NEXT_PUBLIC_ENABLE_PAYWALL === "true";
 const paywallTitle = process.env.NEXT_PUBLIC_PAYWALL_TITLE?.trim() || "Members Only";
 const paywallMessage =
@@ -55,30 +56,34 @@ type ActiveSpeechState = {
   durationMs: number;
   alignment: SpeechAlignment | null;
   performance: SpeechPerformance | null;
+  alignmentStatus: AlignmentStatus;
+  timelineSource: TimelineSource;
   transcriptStrategy: TranscriptStreamStrategy;
 };
 
-type TranscriptStreamStrategy = "pending" | "fallback" | "performance" | "word" | "chunk";
+type AlignmentStatus = "pending" | "ready" | "degraded" | "unavailable";
+
+type TimelineSource = "aligned" | "fallback";
+
+type PlaybackSnapshot = {
+  confirmedMs: number;
+  predictedMs: number;
+};
+
+type TranscriptStreamStrategy = "pending" | "fallback" | "word" | "chunk";
 
 type StreamingSnapshot = {
   strategy: TranscriptStreamStrategy;
+  source: TimelineSource;
   visibleText: string;
   visibleLength: number;
   totalLength: number;
-  fallbackLength: number;
-  performanceLength: number | null;
   alignmentLength: number | null;
+  fallbackLength: number;
+  confirmedMs: number;
+  predictedMs: number;
+  leadMs: number;
 };
-
-function pickLongestVisibleText(...candidates: Array<string | null | undefined>) {
-  return candidates.reduce<string>((best, candidate) => {
-    if (!candidate) {
-      return best;
-    }
-
-    return candidate.length > best.length ? candidate : best;
-  }, "");
-}
 
 function normalizeSpeechPerformance(
   performance: SpeechPerformance,
@@ -466,9 +471,6 @@ function PaywallGate() {
               {paywallCtaLabel}
             </a>
           ) : null}
-          <p className="paywall-hint">
-            Set `NEXT_PUBLIC_ENABLE_PAYWALL=true` and `NEXT_PUBLIC_PAYWALL_CTA_URL` in Vercel for this branch.
-          </p>
         </div>
       </section>
     </main>
@@ -481,7 +483,10 @@ export default function HomePage() {
   const [question, setQuestion] = useState(defaultQuestion);
   const [mouthOpen, setMouthOpen] = useState(0);
   const [speechEnergy, setSpeechEnergy] = useState(0);
-  const [playbackTimeMs, setPlaybackTimeMs] = useState(0);
+  const [playbackSnapshot, setPlaybackSnapshot] = useState<PlaybackSnapshot>({
+    confirmedMs: 0,
+    predictedMs: 0,
+  });
   const [gazeTarget, setGazeTarget] = useState({ x: 0, y: -0.02 });
   const [lipSyncLevel, setLipSyncLevel] = useState(0);
   const [activeSpeech, setActiveSpeech] = useState<ActiveSpeechState | null>(null);
@@ -501,19 +506,25 @@ export default function HomePage() {
   const playbackRequestRef = useRef<string | null>(null);
   const playbackClockRef = useRef({
     startedAtMs: 0,
-    lastElapsedMs: 0,
+    lastConfirmedMs: 0,
+    lastPredictedMs: 0,
   });
   const streamingDebugRef = useRef<{
     entryId: string | null;
     visibleLength: number;
-    elapsedMs: number;
-    alignmentLogged: boolean;
+    confirmedMs: number;
+    predictedMs: number;
+    source: TimelineSource | null;
+    alignmentStatus: AlignmentStatus | null;
   }>({
     entryId: null,
     visibleLength: 0,
-    elapsedMs: 0,
-    alignmentLogged: false,
+    confirmedMs: 0,
+    predictedMs: 0,
+    source: null,
+    alignmentStatus: null,
   });
+  const playbackTimeMs = playbackSnapshot.confirmedMs;
 
   function buildClauseRanges(text: string, speechPlan: SpeechPerformance | null): ClauseRange[] {
     if (!speechPlan?.clauses.length) {
@@ -561,97 +572,70 @@ export default function HomePage() {
     return ranges;
   }
 
-  function getStreamedText(text: string, elapsedMs: number, speechPlan: SpeechPerformance | null) {
+  function getConservativeFallbackText(
+    text: string,
+    confirmedMs: number,
+    speechPlan: SpeechPerformance | null,
+    durationMs: number,
+  ) {
     if (!text) {
       return "";
     }
 
-    if (!speechPlan || speechPlan.durationMs <= 0 || !speechPlan.clauses.length) {
+    const safeElapsedMs = Math.max(0, confirmedMs - FALLBACK_REVEAL_LAG_MS);
+    if (durationMs > 0 && safeElapsedMs >= durationMs) {
       return text;
     }
 
     const clauseRanges = buildClauseRanges(text, speechPlan);
-    if (!clauseRanges.length) {
-      return text;
-    }
+    if (clauseRanges.length) {
+      let visibleLength = 0;
 
-    let visibleLength = 0;
+      for (const range of clauseRanges) {
+        if (safeElapsedMs >= range.endMs) {
+          visibleLength = Math.max(visibleLength, range.end);
+          continue;
+        }
 
-    for (const range of clauseRanges) {
-      if (elapsedMs >= range.endMs) {
-        visibleLength = Math.max(visibleLength, range.end);
-        continue;
-      }
-
-      if (elapsedMs < range.startMs) {
         break;
       }
 
-      const clauseDuration = Math.max(range.endMs - range.startMs, 1);
-      const clauseProgress = Math.min(1, Math.max(0, (elapsedMs - range.startMs) / clauseDuration));
-      const easedProgress = 1 - Math.pow(1 - clauseProgress, 1.28);
-      const targetLength = range.start + Math.round((range.end - range.start) * easedProgress);
-      visibleLength = Math.max(visibleLength, targetLength);
-      break;
+      return text.slice(0, Math.max(0, visibleLength)).trimEnd();
     }
 
-    if (elapsedMs >= speechPlan.durationMs) {
-      return text;
-    }
-
-    const safeLength = Math.max(1, visibleLength);
-    const sliced = text.slice(0, safeLength);
-    const activeRange =
-      clauseRanges.find((range) => elapsedMs >= range.startMs && elapsedMs < range.endMs) ?? null;
-
-    if (!activeRange) {
-      return sliced;
-    }
-
-    const localSlice = text.slice(activeRange.start, safeLength);
-    const lastWhitespace = localSlice.lastIndexOf(" ");
-    if (lastWhitespace > 0 && safeLength < activeRange.end) {
-      return text.slice(0, activeRange.start + lastWhitespace);
-    }
-
-    return sliced;
+    return getFallbackStreamedText(text, safeElapsedMs, durationMs);
   }
 
   function buildStreamingSnapshot(
     speechState: ActiveSpeechState,
-    elapsedMs: number,
+    playback: PlaybackSnapshot,
   ): StreamingSnapshot {
     const alignmentText = speechState.alignment
-      ? getStreamedTextFromAlignment(speechState.fullText, elapsedMs, speechState.alignment)
+      ? getStreamedTextFromAlignment(speechState.fullText, playback.confirmedMs, speechState.alignment)
       : null;
-    const fallbackText =
-      speechState.durationMs > 0
-        ? getFallbackStreamedText(speechState.fullText, elapsedMs, speechState.durationMs)
-        : "";
-    const performanceText = speechState.performance
-      ? getStreamedText(speechState.fullText, elapsedMs, speechState.performance)
-      : null;
-    const preferredText =
-      speechState.transcriptStrategy === "word" || speechState.transcriptStrategy === "chunk"
-        ? alignmentText ?? fallbackText
-        : speechState.transcriptStrategy === "performance"
-          ? performanceText ?? fallbackText
-          : speechState.transcriptStrategy === "fallback"
-            ? fallbackText
-            : "";
+    const fallbackText = getConservativeFallbackText(
+      speechState.fullText,
+      playback.confirmedMs,
+      speechState.performance,
+      speechState.durationMs,
+    );
     const visibleText =
       speechState.transcriptStrategy === "pending"
         ? ""
-        : pickLongestVisibleText(preferredText, performanceText, fallbackText);
-
+        : speechState.transcriptStrategy === "word" || speechState.transcriptStrategy === "chunk"
+          ? alignmentText ?? fallbackText
+          : fallbackText;
     return {
       strategy: speechState.transcriptStrategy,
+      source: speechState.timelineSource,
       visibleText,
       visibleLength: visibleText.length,
       totalLength: speechState.fullText.length,
-      fallbackLength: fallbackText.length,
-      performanceLength: performanceText?.length ?? null,
       alignmentLength: alignmentText?.length ?? null,
+      fallbackLength: fallbackText.length,
+      confirmedMs: playback.confirmedMs,
+      predictedMs: playback.predictedMs,
+      leadMs: Math.max(0, playback.predictedMs - playback.confirmedMs),
     };
   }
 
@@ -672,6 +656,21 @@ export default function HomePage() {
     setUiTranscript(transcript);
   }
 
+  function updateActiveSpeechState(
+    entryId: string | undefined,
+    updater: (current: ActiveSpeechState) => ActiveSpeechState,
+  ) {
+    setActiveSpeech((current) => {
+      if (!current || (entryId && current.entryId !== entryId)) {
+        return current;
+      }
+
+      const nextActiveSpeech = updater(current);
+      activeSpeechRef.current = nextActiveSpeech;
+      return nextActiveSpeech;
+    });
+  }
+
   function startStreamingEntry(entryId: string, fullText: string) {
     const nextActiveSpeech = {
       entryId,
@@ -679,17 +678,24 @@ export default function HomePage() {
       durationMs: 0,
       alignment: null,
       performance: null,
+      alignmentStatus: "pending" as const,
+      timelineSource: "fallback" as const,
       transcriptStrategy: "pending" as const,
     };
 
     activeSpeechRef.current = nextActiveSpeech;
     setActiveSpeech(nextActiveSpeech);
-    setPlaybackTimeMs(0);
+    setPlaybackSnapshot({
+      confirmedMs: 0,
+      predictedMs: 0,
+    });
     streamingDebugRef.current = {
       entryId,
       visibleLength: 0,
-      elapsedMs: 0,
-      alignmentLogged: false,
+      confirmedMs: 0,
+      predictedMs: 0,
+      source: null,
+      alignmentStatus: "pending",
     };
     setUiTranscript((current) =>
       current.map((entry) =>
@@ -750,17 +756,23 @@ export default function HomePage() {
       audioUrlRef.current = null;
     }
 
-    setPlaybackTimeMs(0);
+    setPlaybackSnapshot({
+      confirmedMs: 0,
+      predictedMs: 0,
+    });
     playbackClockRef.current = {
       startedAtMs: 0,
-      lastElapsedMs: 0,
+      lastConfirmedMs: 0,
+      lastPredictedMs: 0,
     };
     activeSpeechRef.current = null;
     streamingDebugRef.current = {
       entryId: null,
       visibleLength: 0,
-      elapsedMs: 0,
-      alignmentLogged: false,
+      confirmedMs: 0,
+      predictedMs: 0,
+      source: null,
+      alignmentStatus: null,
     };
     setActiveSpeech(null);
     setAvatarSpeech(0, 0);
@@ -876,22 +888,33 @@ export default function HomePage() {
         playbackClock.startedAtMs = performance.now() - mediaElapsedMs;
       }
       const clockElapsedMs = Math.max(0, performance.now() - playbackClock.startedAtMs);
-      let nextElapsedMs = Math.max(mediaElapsedMs, clockElapsedMs - PLAYBACK_JITTER_TOLERANCE_MS);
-
-      if (nextElapsedMs < playbackClock.lastElapsedMs) {
-        nextElapsedMs =
-          playbackClock.lastElapsedMs - nextElapsedMs <= PLAYBACK_JITTER_TOLERANCE_MS
-            ? playbackClock.lastElapsedMs
-            : nextElapsedMs;
+      let nextConfirmedMs = mediaElapsedMs;
+      if (nextConfirmedMs < playbackClock.lastConfirmedMs) {
+        nextConfirmedMs =
+          playbackClock.lastConfirmedMs - nextConfirmedMs <= PLAYBACK_JITTER_TOLERANCE_MS
+            ? playbackClock.lastConfirmedMs
+            : nextConfirmedMs;
       }
 
-      if (nextElapsedMs - playbackClock.lastElapsedMs > PLAYBACK_FORWARD_JUMP_CAP_MS) {
-        nextElapsedMs = playbackClock.lastElapsedMs + PLAYBACK_FORWARD_JUMP_CAP_MS;
+      let nextPredictedMs = Math.max(nextConfirmedMs, clockElapsedMs - PLAYBACK_JITTER_TOLERANCE_MS);
+      if (nextPredictedMs < playbackClock.lastPredictedMs) {
+        nextPredictedMs =
+          playbackClock.lastPredictedMs - nextPredictedMs <= PLAYBACK_JITTER_TOLERANCE_MS
+            ? playbackClock.lastPredictedMs
+            : nextPredictedMs;
       }
 
-      playbackClock.lastElapsedMs = nextElapsedMs;
+      if (nextPredictedMs - playbackClock.lastPredictedMs > PLAYBACK_FORWARD_JUMP_CAP_MS) {
+        nextPredictedMs = playbackClock.lastPredictedMs + PLAYBACK_FORWARD_JUMP_CAP_MS;
+      }
+
+      playbackClock.lastConfirmedMs = nextConfirmedMs;
+      playbackClock.lastPredictedMs = nextPredictedMs;
       setAvatarSpeech(expressive, smoothedLevel);
-      setPlaybackTimeMs(Math.round(nextElapsedMs));
+      setPlaybackSnapshot({
+        confirmedMs: Math.round(nextConfirmedMs),
+        predictedMs: Math.round(nextPredictedMs),
+      });
       playbackFrameRef.current = requestAnimationFrame(tick);
     };
 
@@ -1017,13 +1040,43 @@ export default function HomePage() {
       const actualDurationMs = Number.isFinite(audio.duration)
         ? Math.round(audio.duration * 1000)
         : heuristicPerformance?.durationMs ?? 0;
-      const alignmentResult = await fetchSpeechAlignment(blob).catch(() => null);
+      const normalizedPerformance = heuristicPerformance
+        ? normalizeSpeechPerformance(heuristicPerformance, actualDurationMs)
+        : null;
 
-      if (!alignmentResult) {
-        throw new Error("Failed to align speech before playback.");
-      }
+      updateActiveSpeechState(entryId, (current) => ({
+        ...current,
+        durationMs: actualDurationMs,
+        performance: normalizedPerformance,
+        alignmentStatus: "pending",
+        timelineSource: "fallback",
+        transcriptStrategy: "fallback",
+      }));
+      await audio.play();
+      playbackClockRef.current = {
+        startedAtMs: performance.now() - audio.currentTime * 1000,
+        lastConfirmedMs: audio.currentTime * 1000,
+        lastPredictedMs: audio.currentTime * 1000,
+      };
 
       if (playbackRequestRef.current !== playbackRequestId) {
+        return;
+      }
+
+      trackLoudness(analyser, audio);
+      const alignmentResult = await fetchSpeechAlignment(blob).catch(() => null);
+
+      if (playbackRequestRef.current !== playbackRequestId) {
+        return;
+      }
+
+      if (!alignmentResult) {
+        updateActiveSpeechState(entryId, (current) => ({
+          ...current,
+          alignmentStatus: "unavailable",
+          timelineSource: "fallback",
+          transcriptStrategy: "fallback",
+        }));
         return;
       }
 
@@ -1033,34 +1086,17 @@ export default function HomePage() {
         actualDurationMs,
       );
       const transcriptStrategy: TranscriptStreamStrategy = normalizedAlignment.mode;
+      const alignmentStatus: AlignmentStatus =
+        normalizedAlignment.mode === "word" ? "ready" : "degraded";
 
-      setActiveSpeech((current) => {
-        if (!current || current.entryId !== entryId) {
-          return current;
-        }
-
-        const nextActiveSpeech = {
-          ...current,
-          durationMs: actualDurationMs,
-          alignment: normalizedAlignment,
-          performance: alignedPerformance,
-          transcriptStrategy,
-        };
-
-        activeSpeechRef.current = nextActiveSpeech;
-        return nextActiveSpeech;
-      });
-      await audio.play();
-      playbackClockRef.current = {
-        startedAtMs: performance.now() - audio.currentTime * 1000,
-        lastElapsedMs: 0,
-      };
-
-      if (playbackRequestRef.current !== playbackRequestId) {
-        return;
-      }
-
-      trackLoudness(analyser, audio);
+      updateActiveSpeechState(entryId, (current) => ({
+        ...current,
+        alignment: normalizedAlignment,
+        performance: alignedPerformance,
+        alignmentStatus,
+        timelineSource: "aligned",
+        transcriptStrategy,
+      }));
     } catch (error) {
       if (playbackRequestRef.current === playbackRequestId) {
         stopPlayback();
@@ -1085,8 +1121,8 @@ export default function HomePage() {
   }, [session]);
 
   const streamingSnapshot = useMemo(
-    () => (activeSpeech ? buildStreamingSnapshot(activeSpeech, playbackTimeMs) : null),
-    [activeSpeech, playbackTimeMs],
+    () => (activeSpeech ? buildStreamingSnapshot(activeSpeech, playbackSnapshot) : null),
+    [activeSpeech, playbackSnapshot],
   );
 
   const displayedActiveLength = useMemo(
@@ -1100,11 +1136,7 @@ export default function HomePage() {
     }
 
     patchStreamingEntry(activeSpeech.entryId, streamingSnapshot.visibleText);
-  }, [
-    activeSpeech,
-    playbackTimeMs,
-    streamingSnapshot,
-  ]);
+  }, [activeSpeech, playbackSnapshot.confirmedMs, streamingSnapshot]);
 
   useEffect(() => {
     if (!activeSpeech || !streamingSnapshot) {
@@ -1118,26 +1150,20 @@ export default function HomePage() {
       streamingDebugRef.current = {
         entryId: activeSpeech.entryId,
         visibleLength: streamingSnapshot.visibleLength,
-        elapsedMs: playbackTimeMs,
-        alignmentLogged: false,
+        confirmedMs: streamingSnapshot.confirmedMs,
+        predictedMs: streamingSnapshot.predictedMs,
+        source: streamingSnapshot.source,
+        alignmentStatus: activeSpeech.alignmentStatus,
       };
       return;
     }
 
-    const charDelta = streamingSnapshot.visibleLength - debugState.visibleLength;
-    const timeDelta = playbackTimeMs - debugState.elapsedMs;
-    const alignmentDelta =
-      streamingSnapshot.alignmentLength != null
-        ? Math.abs(streamingSnapshot.alignmentLength - streamingSnapshot.visibleLength)
-        : 0;
-
-    if (!debugState.alignmentLogged && streamingSnapshot.alignmentLength != null) {
-      debugState.alignmentLogged = true;
-    }
-
     debugState.visibleLength = streamingSnapshot.visibleLength;
-    debugState.elapsedMs = playbackTimeMs;
-  }, [activeSpeech, playbackTimeMs, streamingSnapshot]);
+    debugState.confirmedMs = streamingSnapshot.confirmedMs;
+    debugState.predictedMs = streamingSnapshot.predictedMs;
+    debugState.source = streamingSnapshot.source;
+    debugState.alignmentStatus = activeSpeech.alignmentStatus;
+  }, [activeSpeech, streamingSnapshot]);
 
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
