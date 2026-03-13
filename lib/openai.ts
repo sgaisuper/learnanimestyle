@@ -2,6 +2,20 @@ import OpenAI from "openai";
 import { toFile } from "openai/uploads";
 import type { SpeechAlignment } from "@/lib/types";
 
+const MIN_ALIGNMENT_SPAN_MS = 24;
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function reachesThreshold(count: number, total: number, fraction: number) {
+  if (count <= 0 || total <= 0) {
+    return false;
+  }
+
+  return count >= Math.max(1, Math.floor(total * fraction));
+}
+
 function getClient() {
   const apiKey = process.env.OPENAI_API_KEY;
 
@@ -103,7 +117,7 @@ export async function createSpeechAlignment(
     }>;
   };
 
-  const words = (response.words ?? [])
+  const rawWords = (response.words ?? [])
     .map((word) => ({
       text: word.word?.trim() ?? "",
       startMs: Math.max(0, Math.round((word.start ?? 0) * 1000)),
@@ -111,12 +125,55 @@ export async function createSpeechAlignment(
     }))
     .filter((word) => word.text.length > 0 && word.endMs >= word.startMs);
 
-  const durationMs =
-    words.at(-1)?.endMs ??
-    Math.max(0, Math.round((response.duration ?? 0) * 1000));
+  let zeroStartCount = 0;
+  let zeroDurationCount = 0;
+  let nonMonotonicCount = 0;
+  let previousStartMs = -1;
+
+  for (const word of rawWords) {
+    if (word.startMs === 0) {
+      zeroStartCount += 1;
+    }
+    if (word.endMs - word.startMs <= 0) {
+      zeroDurationCount += 1;
+    }
+    if (word.startMs <= previousStartMs) {
+      nonMonotonicCount += 1;
+    }
+    previousStartMs = Math.max(previousStartMs, word.startMs);
+  }
+
+  const responseDurationMs = Math.max(0, Math.round((response.duration ?? 0) * 1000));
+  const wordEndDurationMs = rawWords.at(-1)?.endMs ?? 0;
+  const durationMs = Math.max(responseDurationMs, wordEndDurationMs);
+  const observedSpanMs =
+    rawWords.length > 0 ? Math.max(0, rawWords[rawWords.length - 1].endMs - rawWords[0].startMs) : 0;
+  const compressedSpanRatio =
+    durationMs > 0 ? clamp(observedSpanMs / durationMs, 0, 1) : observedSpanMs > 0 ? 1 : 0;
+  const isReliable =
+    rawWords.length <= 1 ||
+    !(
+      compressedSpanRatio < 0.35 ||
+      reachesThreshold(zeroDurationCount, rawWords.length, 0.25) ||
+      reachesThreshold(zeroStartCount, rawWords.length, 1 / 3) ||
+      reachesThreshold(nonMonotonicCount, rawWords.length, 1 / 3) ||
+      reachesThreshold(
+        rawWords.filter((word) => word.endMs - word.startMs < MIN_ALIGNMENT_SPAN_MS).length,
+        rawWords.length,
+        0.5,
+      )
+    );
 
   return {
     durationMs,
-    words,
+    mode: isReliable ? "word" : "chunk",
+    health: {
+      zeroStartCount,
+      zeroDurationCount,
+      nonMonotonicCount,
+      compressedSpanRatio,
+      isReliable,
+    },
+    words: rawWords,
   };
 }

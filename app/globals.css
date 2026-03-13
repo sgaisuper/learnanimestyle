@@ -39,6 +39,61 @@ textarea {
   padding: 12px;
 }
 
+.paywall-shell {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.paywall-card {
+  width: min(720px, 100%);
+  padding: 40px;
+  border: 1px solid var(--line);
+  border-radius: 32px;
+  background:
+    linear-gradient(135deg, rgba(255, 251, 245, 0.96), rgba(255, 225, 210, 0.88)),
+    var(--panel);
+  box-shadow: var(--shadow);
+  text-align: center;
+}
+
+.paywall-card h1 {
+  margin: 0;
+  font-size: clamp(2.6rem, 5vw, 4.6rem);
+  line-height: 0.95;
+  letter-spacing: -0.04em;
+}
+
+.paywall-copy {
+  margin: 20px auto 0;
+  max-width: 36rem;
+  color: var(--muted);
+  font-size: 1.08rem;
+  line-height: 1.6;
+}
+
+.paywall-actions {
+  margin-top: 28px;
+  display: grid;
+  gap: 14px;
+  justify-items: center;
+}
+
+.paywall-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 160px;
+  text-decoration: none;
+}
+
+.paywall-hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
 .dashboard {
   height: 100%;
   max-width: 1600px;
@@ -441,5 +496,11 @@ textarea {
 
   .lip-sync-meter {
     bottom: 14px;
+  }
+}
+
+@media (max-width: 640px) {
+  .paywall-card {
+    padding: 28px 20px;
   }
 }

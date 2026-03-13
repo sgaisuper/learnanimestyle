@@ -45,8 +45,20 @@ export type AlignedWord = {
   endMs: number;
 };
 
+export type SpeechAlignmentMode = "word" | "chunk";
+
+export type SpeechAlignmentHealth = {
+  zeroStartCount: number;
+  zeroDurationCount: number;
+  nonMonotonicCount: number;
+  compressedSpanRatio: number;
+  isReliable: boolean;
+};
+
 export type SpeechAlignment = {
   durationMs: number;
+  mode: SpeechAlignmentMode;
+  health: SpeechAlignmentHealth;
   words: AlignedWord[];
 };
 

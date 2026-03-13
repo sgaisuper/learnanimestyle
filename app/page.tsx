@@ -18,6 +18,18 @@ function getErrorMessage(data: SessionPayload | { error: string }, fallback: str
 const defaultQuestion =
   "Why does this paper matter, and what should I pay attention to next?";
 
+const MIN_WORD_SPAN_MS = 60;
+const MIN_CHUNK_SPAN_MS = 70;
+const PLAYBACK_JITTER_TOLERANCE_MS = 18;
+const PLAYBACK_FORWARD_JUMP_CAP_MS = 220;
+const paywallEnabled = process.env.NEXT_PUBLIC_ENABLE_PAYWALL === "true";
+const paywallTitle = process.env.NEXT_PUBLIC_PAYWALL_TITLE?.trim() || "Members Only";
+const paywallMessage =
+  process.env.NEXT_PUBLIC_PAYWALL_MESSAGE?.trim() ||
+  "This deployment is reserved for paying users. Subscribe to unlock guided lessons, live transcript playback, and follow-up tutoring.";
+const paywallCtaLabel = process.env.NEXT_PUBLIC_PAYWALL_CTA_LABEL?.trim() || "Join now";
+const paywallCtaUrl = process.env.NEXT_PUBLIC_PAYWALL_CTA_URL?.trim() || "";
+
 function scaleTime(value: number, ratio: number) {
   return Math.max(0, Math.round(value * ratio));
 }
@@ -46,7 +58,7 @@ type ActiveSpeechState = {
   transcriptStrategy: TranscriptStreamStrategy;
 };
 
-type TranscriptStreamStrategy = "pending" | "fallback" | "performance" | "alignment";
+type TranscriptStreamStrategy = "pending" | "fallback" | "performance" | "word" | "chunk";
 
 type StreamingSnapshot = {
   strategy: TranscriptStreamStrategy;
@@ -57,6 +69,16 @@ type StreamingSnapshot = {
   performanceLength: number | null;
   alignmentLength: number | null;
 };
+
+function pickLongestVisibleText(...candidates: Array<string | null | undefined>) {
+  return candidates.reduce<string>((best, candidate) => {
+    if (!candidate) {
+      return best;
+    }
+
+    return candidate.length > best.length ? candidate : best;
+  }, "");
+}
 
 function normalizeSpeechPerformance(
   performance: SpeechPerformance,
@@ -97,6 +119,155 @@ function normalizeSpeechPerformance(
   };
 }
 
+function reachesThreshold(count: number, total: number, fraction: number) {
+  if (count <= 0 || total <= 0) {
+    return false;
+  }
+
+  return count >= Math.max(1, Math.floor(total * fraction));
+}
+
+function createAlignmentHealth(words: SpeechAlignment["words"], durationMs: number) {
+  let previousStartMs = -1;
+  let zeroStartCount = 0;
+  let zeroDurationCount = 0;
+  let nonMonotonicCount = 0;
+
+  words.forEach((word) => {
+    if (word.startMs === 0) {
+      zeroStartCount += 1;
+    }
+    if (word.endMs - word.startMs <= 0) {
+      zeroDurationCount += 1;
+    }
+    if (word.startMs <= previousStartMs) {
+      nonMonotonicCount += 1;
+    }
+    previousStartMs = Math.max(previousStartMs, word.startMs);
+  });
+
+  const observedSpanMs = words.length > 0 ? Math.max(0, words[words.length - 1].endMs - words[0].startMs) : 0;
+  const compressedSpanRatio =
+    durationMs > 0 ? clamp(observedSpanMs / durationMs, 0, 1) : observedSpanMs > 0 ? 1 : 0;
+  const narrowSpanCount = words.filter((word) => word.endMs - word.startMs < MIN_WORD_SPAN_MS).length;
+  const isReliable =
+    words.length <= 1 ||
+    !(
+      compressedSpanRatio < 0.35 ||
+      reachesThreshold(zeroDurationCount, words.length, 0.25) ||
+      reachesThreshold(zeroStartCount, words.length, 1 / 3) ||
+      reachesThreshold(nonMonotonicCount, words.length, 1 / 3) ||
+      reachesThreshold(narrowSpanCount, words.length, 0.5)
+    );
+
+  return {
+    zeroStartCount,
+    zeroDurationCount,
+    nonMonotonicCount,
+    compressedSpanRatio,
+    isReliable,
+  };
+}
+
+function createWeightedSlices(words: SpeechAlignment["words"], startMs: number, endMs: number, minSpanMs: number) {
+  const safeStartMs = Math.max(0, startMs);
+  const safeEndMs = Math.max(safeStartMs + 1, endMs);
+  const latestStartMs = Math.max(safeStartMs, safeEndMs - 1);
+  const weightedWords = words.map((word) => ({
+    word,
+    weight: Math.max(normalizeToken(word.text).length, 1),
+  }));
+  const totalWeight = weightedWords.reduce((sum, entry) => sum + entry.weight, 0);
+  let cursorMs = safeStartMs;
+
+  return weightedWords.map(({ word, weight }, index) => {
+    const remainingWords = weightedWords.length - index;
+    const remainingMs = Math.max(safeEndMs - cursorMs, 1);
+    const sliceMs =
+      index === weightedWords.length - 1
+        ? remainingMs
+        : Math.max(
+            minSpanMs,
+            Math.min(
+              remainingMs,
+              Math.round((weight / Math.max(totalWeight, 1)) * (safeEndMs - safeStartMs)),
+            ),
+          );
+    const nextEndMs = Math.min(safeEndMs, cursorMs + sliceMs);
+    const start = Math.min(cursorMs, latestStartMs);
+    const end =
+      index === weightedWords.length - 1
+        ? safeEndMs
+        : clamp(Math.max(start + 1, nextEndMs), start + 1, safeEndMs);
+
+    cursorMs =
+      remainingWords > 1 ? Math.min(safeEndMs, Math.max(end, start + minSpanMs)) : safeEndMs;
+
+    return {
+      ...word,
+      startMs: start,
+      endMs: Math.max(end, start + 1),
+    };
+  });
+}
+
+function repairWordAlignment(words: SpeechAlignment["words"], durationMs: number) {
+  if (!words.length) {
+    return words;
+  }
+
+  const repairedWords = words.map((word) => ({
+    ...word,
+    startMs: clamp(word.startMs, 0, durationMs),
+    endMs: clamp(Math.max(word.endMs, word.startMs), 0, durationMs),
+  }));
+  const reliable: boolean[] = repairedWords.map(
+    (word, index) =>
+      word.endMs - word.startMs >= MIN_WORD_SPAN_MS &&
+      (index === 0 || word.startMs > repairedWords[index - 1].startMs),
+  );
+
+  let index = 0;
+  while (index < repairedWords.length) {
+    if (reliable[index]) {
+      index += 1;
+      continue;
+    }
+
+    const startIndex = index;
+    while (index < repairedWords.length && !reliable[index]) {
+      index += 1;
+    }
+
+    const endIndex = index - 1;
+    const previousReliableIndex = startIndex > 0 ? startIndex - 1 : -1;
+    const nextReliableIndex = index < repairedWords.length ? index : -1;
+    const previousEndMs = previousReliableIndex >= 0 ? repairedWords[previousReliableIndex].endMs : 0;
+    const nextStartMs = nextReliableIndex >= 0 ? repairedWords[nextReliableIndex].startMs : durationMs;
+    const runWords = repairedWords.slice(startIndex, endIndex + 1);
+    const availableEndMs = Math.max(previousEndMs + runWords.length, nextStartMs);
+    const repairedRun = createWeightedSlices(runWords, previousEndMs, availableEndMs, MIN_WORD_SPAN_MS);
+
+    repairedRun.forEach((word, offset) => {
+      repairedWords[startIndex + offset] = word;
+      reliable[startIndex + offset] = true;
+    });
+  }
+
+  return repairedWords.map((word, wordIndex) => {
+    const previousWord = repairedWords[wordIndex - 1];
+    const nextWord = repairedWords[wordIndex + 1];
+    const startMs =
+      previousWord == null ? word.startMs : Math.max(word.startMs, previousWord.endMs);
+    const maxEndMs = nextWord == null ? durationMs : Math.max(startMs + 1, nextWord.startMs);
+    return {
+      ...word,
+      startMs: clamp(startMs, 0, durationMs),
+      endMs: clamp(Math.max(startMs + 1, word.endMs), startMs + 1, Math.max(startMs + 1, maxEndMs)),
+    };
+  });
+}
+
 function normalizeSpeechAlignment(
   alignment: SpeechAlignment,
   actualDurationMs: number,
@@ -113,93 +284,31 @@ function normalizeSpeechAlignment(
   if (!scaledWords.length) {
     return {
       durationMs: safeActualDurationMs,
+      mode: "chunk",
+      health: {
+        zeroStartCount: 0,
+        zeroDurationCount: 0,
+        nonMonotonicCount: 0,
+        compressedSpanRatio: 0,
+        isReliable: false,
+      },
       words: [],
     };
   }
 
-  const clampedWords = scaledWords.map((word) => ({
-    ...word,
-    startMs: clamp(word.startMs, 0, safeActualDurationMs),
-    endMs: clamp(Math.max(word.endMs, word.startMs), 0, safeActualDurationMs),
-  }));
-
-  let previousStartMs = -1;
-  let duplicateStartCount = 0;
-  let narrowSpanCount = 0;
-
-  clampedWords.forEach((word) => {
-    if (word.startMs <= previousStartMs) {
-      duplicateStartCount += 1;
-    }
-
-    if (word.endMs - word.startMs < 24) {
-      narrowSpanCount += 1;
-    }
-
-    previousStartMs = Math.max(previousStartMs, word.startMs);
-  });
-
-  const observedSpanMs =
-    clampedWords.at(-1) != null ? clampedWords[clampedWords.length - 1].endMs - clampedWords[0].startMs : 0;
-  const needsRedistribution =
-    clampedWords.length > 1 &&
-    (observedSpanMs < safeActualDurationMs * 0.35 ||
-      duplicateStartCount >= Math.floor(clampedWords.length / 3) ||
-      narrowSpanCount >= Math.floor(clampedWords.length / 2));
-
-  if (needsRedistribution) {
-    const weightedWords = clampedWords.map((word) => {
-      const normalized = normalizeToken(word.text);
-      const weight = Math.max(normalized.length, 1);
-      return { word, weight };
-    });
-    const totalWeight = weightedWords.reduce((sum, entry) => sum + entry.weight, 0);
-    let cursorMs = 0;
-
-    return {
-      durationMs: safeActualDurationMs,
-      words: weightedWords.map(({ word, weight }, index) => {
-        const remainingWords = weightedWords.length - index;
-        const remainingMs = Math.max(safeActualDurationMs - cursorMs, 1);
-        const sliceMs =
-          index === weightedWords.length - 1
-            ? remainingMs
-            : Math.max(
-                70,
-                Math.min(
-                  remainingMs,
-                  Math.round((weight / Math.max(totalWeight, 1)) * safeActualDurationMs),
-                ),
-              );
-        const startMs = cursorMs;
-        const endMs = Math.min(safeActualDurationMs, startMs + sliceMs);
-
-        cursorMs =
-          remainingWords > 1 ? Math.min(safeActualDurationMs, Math.max(endMs, startMs + 70)) : safeActualDurationMs;
-
-        return {
-          ...word,
-          startMs,
-          endMs: Math.max(endMs, startMs + 1),
-        };
-      }),
-    };
-  }
+  const repairedWords = repairWordAlignment(scaledWords, safeActualDurationMs);
+  const repairedHealth = createAlignmentHealth(repairedWords, safeActualDurationMs);
+  const mode = repairedHealth.isReliable ? "word" : "chunk";
+  const normalizedWords =
+    mode === "word"
+      ? repairedWords
+      : createWeightedSlices(repairedWords, 0, safeActualDurationMs, MIN_CHUNK_SPAN_MS);
 
   return {
     durationMs: safeActualDurationMs,
-    words: clampedWords.map((word, index) => {
-      const previousWord = clampedWords[index - 1];
-      const startMs =
-        previousWord == null ? word.startMs : Math.max(word.startMs, previousWord.startMs + 1);
-      const endMs = Math.max(startMs + 1, word.endMs);
-
-      return {
-        ...word,
-        startMs: clamp(startMs, 0, safeActualDurationMs),
-        endMs: clamp(endMs, 0, safeActualDurationMs),
-      };
-    }),
+    mode,
+    health: createAlignmentHealth(normalizedWords, safeActualDurationMs),
+    words: normalizedWords,
   };
 }
 
@@ -298,7 +407,8 @@ function getStreamedTextFromAlignment(
   let visibleLength = 0;
 
   for (const range of tokenRanges) {
-    if (elapsedMs >= range.startMs) {
+    const revealThresholdMs = alignment.mode === "chunk" ? range.endMs : range.startMs;
+    if (elapsedMs >= revealThresholdMs) {
       visibleLength = Math.max(visibleLength, range.end);
       continue;
     }
@@ -338,6 +448,33 @@ function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
 }
 
+function PaywallGate() {
+  return (
+    <main className="paywall-shell">
+      <section className="paywall-card">
+        <p className="eyebrow">Private Deployment</p>
+        <h1>{paywallTitle}</h1>
+        <p className="paywall-copy">{paywallMessage}</p>
+        <div className="paywall-actions">
+          {paywallCtaUrl ? (
+            <a
+              className="primary-button paywall-button"
+              href={paywallCtaUrl}
+              target="_blank"
+              rel="noreferrer"
+            >
+              {paywallCtaLabel}
+            </a>
+          ) : null}
+          <p className="paywall-hint">
+            Set `NEXT_PUBLIC_ENABLE_PAYWALL=true` and `NEXT_PUBLIC_PAYWALL_CTA_URL` in Vercel for this branch.
+          </p>
+        </div>
+      </section>
+    </main>
+  );
+}
+
 export default function HomePage() {
   const [pdf, setPdf] = useState<File | null>(null);
   const [duration, setDuration] = useState(8);
@@ -362,6 +499,10 @@ export default function HomePage() {
   const audioPrimedRef = useRef(false);
   const activeSpeechRef = useRef<ActiveSpeechState | null>(null);
   const playbackRequestRef = useRef<string | null>(null);
+  const playbackClockRef = useRef({
+    startedAtMs: 0,
+    lastElapsedMs: 0,
+  });
   const streamingDebugRef = useRef<{
     entryId: string | null;
     visibleLength: number;
@@ -483,15 +624,33 @@ export default function HomePage() {
     const alignmentText = speechState.alignment
       ? getStreamedTextFromAlignment(speechState.fullText, elapsedMs, speechState.alignment)
       : null;
-    const visibleText = speechState.transcriptStrategy === "alignment" ? alignmentText ?? "" : "";
+    const fallbackText =
+      speechState.durationMs > 0
+        ? getFallbackStreamedText(speechState.fullText, elapsedMs, speechState.durationMs)
+        : "";
+    const performanceText = speechState.performance
+      ? getStreamedText(speechState.fullText, elapsedMs, speechState.performance)
+      : null;
+    const preferredText =
+      speechState.transcriptStrategy === "word" || speechState.transcriptStrategy === "chunk"
+        ? alignmentText ?? fallbackText
+        : speechState.transcriptStrategy === "performance"
+          ? performanceText ?? fallbackText
+          : speechState.transcriptStrategy === "fallback"
+            ? fallbackText
+            : "";
+    const visibleText =
+      speechState.transcriptStrategy === "pending"
+        ? ""
+        : pickLongestVisibleText(preferredText, performanceText, fallbackText);
 
     return {
       strategy: speechState.transcriptStrategy,
       visibleText,
       visibleLength: visibleText.length,
       totalLength: speechState.fullText.length,
-      fallbackLength: 0,
-      performanceLength: null,
+      fallbackLength: fallbackText.length,
+      performanceLength: performanceText?.length ?? null,
       alignmentLength: alignmentText?.length ?? null,
     };
   }
@@ -592,6 +751,10 @@ export default function HomePage() {
     }
 
     setPlaybackTimeMs(0);
+    playbackClockRef.current = {
+      startedAtMs: 0,
+      lastElapsedMs: 0,
+    };
     activeSpeechRef.current = null;
     streamingDebugRef.current = {
       entryId: null,
@@ -707,8 +870,28 @@ export default function HomePage() {
           ? Math.min(1, 0.16 + smoothedLevel * 0.78 + cadence * 0.18)
           : 0;
 
+      const playbackClock = playbackClockRef.current;
+      const mediaElapsedMs = audio.currentTime * 1000;
+      if (playbackClock.startedAtMs <= 0) {
+        playbackClock.startedAtMs = performance.now() - mediaElapsedMs;
+      }
+      const clockElapsedMs = Math.max(0, performance.now() - playbackClock.startedAtMs);
+      let nextElapsedMs = Math.max(mediaElapsedMs, clockElapsedMs - PLAYBACK_JITTER_TOLERANCE_MS);
+
+      if (nextElapsedMs < playbackClock.lastElapsedMs) {
+        nextElapsedMs =
+          playbackClock.lastElapsedMs - nextElapsedMs <= PLAYBACK_JITTER_TOLERANCE_MS
+            ? playbackClock.lastElapsedMs
+            : nextElapsedMs;
+      }
+
+      if (nextElapsedMs - playbackClock.lastElapsedMs > PLAYBACK_FORWARD_JUMP_CAP_MS) {
+        nextElapsedMs = playbackClock.lastElapsedMs + PLAYBACK_FORWARD_JUMP_CAP_MS;
+      }
+
+      playbackClock.lastElapsedMs = nextElapsedMs;
       setAvatarSpeech(expressive, smoothedLevel);
-      setPlaybackTimeMs(audio.currentTime * 1000);
+      setPlaybackTimeMs(Math.round(nextElapsedMs));
       playbackFrameRef.current = requestAnimationFrame(tick);
     };
 
@@ -849,7 +1032,7 @@ export default function HomePage() {
         createAlignedSpeechPerformance(text, normalizedAlignment),
         actualDurationMs,
       );
-      const transcriptStrategy: TranscriptStreamStrategy = "alignment";
+      const transcriptStrategy: TranscriptStreamStrategy = normalizedAlignment.mode;
 
       setActiveSpeech((current) => {
         if (!current || current.entryId !== entryId) {
@@ -868,6 +1051,10 @@ export default function HomePage() {
         return nextActiveSpeech;
       });
       await audio.play();
+      playbackClockRef.current = {
+        startedAtMs: performance.now() - audio.currentTime * 1000,
+        lastElapsedMs: 0,
+      };
 
       if (playbackRequestRef.current !== playbackRequestId) {
         return;
@@ -1150,6 +1337,10 @@ export default function HomePage() {
         Math.round((session.nextBeatIndex / Math.max(session.studyPlan.beats.length, 1)) * 100),
       )
     : 0;
+
+  if (paywallEnabled) {
+    return <PaywallGate />;
+  }
 
   return (
     <main className="shell">
