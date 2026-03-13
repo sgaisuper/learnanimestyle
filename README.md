@@ -51,3 +51,14 @@ npm run dev
 - A bundled sample girl model is available at `public/vrm/AvatarSample_A.vrm` and loads by default.
 - The avatar uses a small procedural idle pose in the browser: gentle sway, breathing, and arm settling on top of the neutral pose.
 - This is an AIRI-style tutor shell, not the full `moeru-ai/airi` application.
+
+## Improvement Plan
+
+To move this MVP closer to a full tutor experience, the next iterations should focus on:
+
+- [ ] Stability: harden upload and lesson generation flows, improve retry handling, surface clearer errors, add request timeouts, and cover key flows with integration tests.
+- [ ] Expressiveness: expand avatar animation beyond mouth movement with gestures, head turns, emotion states, better timing between speech and motion, and more natural lesson pacing.
+- [ ] Quizzes: generate checkpoint questions after each lesson segment, support multiple-choice and short-answer formats, grade responses, and adapt the next explanation based on mistakes.
+- [ ] Images: extract or generate supporting visuals for paper concepts such as diagrams, figures, summaries, and step-by-step breakdowns that appear alongside the tutor.
+- [ ] Videos: add short visual explainers for dynamic concepts, timeline-style lesson playback, and synchronized audio, captions, and scene changes for a more complete teaching flow.
+- [ ] Full tutor features: introduce memory across sessions, progress tracking, lesson objectives, study recommendations, and a richer back-and-forth teaching loop that feels closer to a complete personal tutor.
