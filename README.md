@@ -1,5 +1,7 @@
 # Airi Paper Tutor
 
+![Airi Paper Tutor preview](public/image.png)
+
 This is a focused MVP for the flow you described:
 
 - upload an arXiv-style PDF
