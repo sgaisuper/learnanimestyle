@@ -28,6 +28,7 @@ const paywallTitle = process.env.NEXT_PUBLIC_PAYWALL_TITLE?.trim() || "Members O
 const paywallMessage =
   process.env.NEXT_PUBLIC_PAYWALL_MESSAGE?.trim() ||
   "This deployment is reserved for paying users. Subscribe to unlock guided lessons, live transcript playback, and follow-up tutoring.";
+const paywallPrice = process.env.NEXT_PUBLIC_PAYWALL_PRICE?.trim() || "$99 / mth";
 const paywallCtaLabel = process.env.NEXT_PUBLIC_PAYWALL_CTA_LABEL?.trim() || "Join now";
 const paywallCtaUrl = process.env.NEXT_PUBLIC_PAYWALL_CTA_URL?.trim() || "";
 
@@ -458,12 +459,26 @@ function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
 }
 
-function PaywallGate() {
+function PricingModal({ open, onClose }: { open: boolean; onClose: () => void }) {
+  if (!open) {
+    return null;
+  }
+
   return (
-    <main className="paywall-shell">
-      <section className="paywall-card">
+    <div className="pricing-modal-backdrop" role="presentation" onClick={onClose}>
+      <section
+        className="paywall-card pricing-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="pricing-modal-title"
+        onClick={(event) => event.stopPropagation()}
+      >
         <p className="eyebrow">Private Deployment</p>
-        <h1>{paywallTitle}</h1>
+        <button className="pricing-modal-close" type="button" onClick={onClose} aria-label="Close pricing">
+          Close
+        </button>
+        <h1 id="pricing-modal-title">{paywallTitle}</h1>
+        <p className="pricing-amount">{paywallPrice}</p>
         <p className="paywall-copy">{paywallMessage}</p>
         <div className="paywall-actions">
           {paywallCtaUrl ? (
@@ -476,9 +491,12 @@ function PaywallGate() {
               {paywallCtaLabel}
             </a>
           ) : null}
+          <button className="secondary-button" type="button" onClick={onClose}>
+            Maybe later
+          </button>
         </div>
       </section>
-    </main>
+    </div>
   );
 }
 
@@ -498,6 +516,7 @@ export default function HomePage() {
   const [session, setSession] = useState<SessionPayload | null>(null);
   const [uiTranscript, setUiTranscript] = useState<TranscriptEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [showPricingModal, setShowPricingModal] = useState(false);
   const [isPending, startTransition] = useTransition();
   const transcriptEndRef = useRef<HTMLDivElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -1243,6 +1262,15 @@ export default function HomePage() {
     });
   }
 
+  function handleBuildLessonClick() {
+    if (paywallEnabled) {
+      setShowPricingModal(true);
+      return;
+    }
+
+    void initializeSession();
+  }
+
   async function continueLesson() {
     if (!session) return;
 
@@ -1369,12 +1397,9 @@ export default function HomePage() {
       )
     : 0;
 
-  if (paywallEnabled) {
-    return <PaywallGate />;
-  }
-
   return (
     <main className="shell">
+      <PricingModal open={showPricingModal} onClose={() => setShowPricingModal(false)} />
       <section className="dashboard">
         <div className="content-column">
           <section className="hero">
@@ -1411,8 +1436,8 @@ export default function HomePage() {
                 />
               </label>
 
-              <button className="primary-button" onClick={initializeSession} disabled={isPending}>
-                {isPending ? "Building lesson..." : "Start lesson"}
+              <button className="primary-button" onClick={handleBuildLessonClick} disabled={isPending}>
+                {isPending ? "Building lesson..." : "Build lesson"}
               </button>
 
               {session ? (
@@ -1500,7 +1525,7 @@ export default function HomePage() {
                     <p>How to start:</p>
                     <p>1. Choose an arXiv PDF in the lesson setup panel.</p>
                     <p>2. Pick how many minutes you want the guided lesson to run.</p>
-                    <p>3. Click Start lesson to generate the opening explanation.</p>
+                    <p>3. Click Build lesson to generate the opening explanation.</p>
                     <p>4. Use Carry on for the next beat, or type a question to interrupt.</p>
                   </div>
                 )}

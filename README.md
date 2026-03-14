@@ -40,7 +40,7 @@ npm run dev
 
 4. Open `http://localhost:3000`
 
-5. Click `Start lesson` after choosing a PDF.
+5. Click `Build lesson` after choosing a PDF.
 
 ## Notes
 
@@ -48,7 +48,7 @@ npm run dev
 - The initial response creates the study plan only. Each `Carry on` generates the next spoken beat so the lesson length stays controllable.
 - Spoken playback uses OpenAI TTS via `/api/tts`, with a feminine `shimmer` default voice and browser loudness analysis driving VRM mouth expressions in the canvas viewer.
 - You can change the TTS voice with `OPENAI_TTS_VOICE` in `.env.local`.
-- You can enable a branch-specific paywall by setting `NEXT_PUBLIC_ENABLE_PAYWALL=true` and providing `NEXT_PUBLIC_PAYWALL_CTA_URL` in Vercel for the `paywall` branch deployment.
+- You can enable a branch-specific paywall by setting `NEXT_PUBLIC_ENABLE_PAYWALL=true`. When enabled, uploads remain available and the `Build lesson` action opens a pricing modal instead of starting lesson generation. Set `NEXT_PUBLIC_PAYWALL_CTA_URL` to send users to checkout, and optionally set `NEXT_PUBLIC_PAYWALL_PRICE` to override the default `$99 / mth` label.
 - A bundled sample girl model is available at `public/vrm/AvatarSample_A.vrm` and loads by default.
 - `AvatarSample_A.vrm` is sourced from the `madjin/vrm-samples` repository; keep that attribution with the sample asset and follow the usage terms noted in that project README.
 - The avatar uses a small procedural idle pose in the browser: gentle sway, breathing, and arm settling on top of the neutral pose.

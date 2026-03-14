@@ -46,7 +46,19 @@ textarea {
   padding: 24px;
 }
 
+.pricing-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(20, 16, 14, 0.48);
+  backdrop-filter: blur(10px);
+}
+
 .paywall-card {
+  position: relative;
   width: min(720px, 100%);
   padding: 40px;
   border: 1px solid var(--line);
@@ -56,6 +68,27 @@ textarea {
     var(--panel);
   box-shadow: var(--shadow);
   text-align: center;
+}
+
+.pricing-modal {
+  width: min(560px, 100%);
+}
+
+.pricing-modal-close {
+  position: absolute;
+  top: 18px;
+  right: 18px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.pricing-amount {
+  margin: 18px 0 0;
+  font-size: clamp(2rem, 4vw, 3rem);
+  line-height: 1;
+  color: var(--accent);
 }
 
 .paywall-card h1 {
@@ -496,5 +529,10 @@ textarea {
 @media (max-width: 640px) {
   .paywall-card {
     padding: 28px 20px;
+  }
+
+  .pricing-modal-close {
+    top: 12px;
+    right: 14px;
   }
 }
